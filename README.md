@@ -235,3 +235,7 @@ go build -o terraform-provider-jobcelis
 ## License
 
 MIT
+
+## Releasing
+
+Bump `VERSION` and merge to `main`. The [Release workflow](.github/workflows/release.yml) tags `vX.Y.Z`, and GoReleaser builds, signs and publishes the GitHub Release that the Terraform Registry picks up. Changes that do not bump the version release nothing. Every pull request runs [CI](.github/workflows/ci.yml).

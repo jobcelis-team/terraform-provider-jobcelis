@@ -1,12 +1,24 @@
+# Releases automatically when VERSION changes on main:
+#   1. reads the version from VERSION
+#   2. if the tag vX.Y.Z does not exist yet, tags the commit
+#   3. GoReleaser builds, signs (GPG_PRIVATE_KEY) and creates the GitHub Release,
+#      which the Terraform Registry picks up
+# Bump VERSION to release; any other change releases nothing. Pushing a vX.Y.Z
+# tag by hand still works.
 name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   goreleaser:
@@ -16,17 +28,46 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Which release?
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="v$(tr -d '[:space:]' < VERSION)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG already exists: nothing to do"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A tag pushed with GITHUB_TOKEN does not start other workflows, so GoReleaser runs here
+      - name: Tag the release
+        if: steps.v.outputs.release == 'true' && github.ref_type != 'tag'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.v.outputs.tag }}" -m "${{ steps.v.outputs.tag }}"
+          git push origin "${{ steps.v.outputs.tag }}"
+
       - uses: actions/setup-go@v5
+        if: steps.v.outputs.release == 'true'
         with:
           go-version: "1.21"
 
       - name: Import GPG key
         id: import_gpg
+        if: steps.v.outputs.release == 'true'
         uses: crazy-max/ghaction-import-gpg@v6
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
 
       - name: Run GoReleaser
+        if: steps.v.outputs.release == 'true'
         uses: goreleaser/goreleaser-action@v6
         with:
           args: release --clean

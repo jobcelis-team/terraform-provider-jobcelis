@@ -1,0 +1,28 @@
+# Builds and vets every pull request (Dependabot's too), and checks the GoReleaser
+# config, so a change that would break the release fails here.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Build and vet
+        run: go build ./... && go vet ./...
+
+      - name: Check the GoReleaser config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: check
