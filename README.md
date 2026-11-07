@@ -239,4 +239,4 @@ Business Source License 1.1 (BUSL-1.1). See [LICENSE](LICENSE) for the full term
 
 ## Releasing
 
-Bump `VERSION` and merge to `main`. The [Release workflow](.github/workflows/release.yml) tags `vX.Y.Z`, and GoReleaser builds, signs and publishes the GitHub Release that the Terraform Registry picks up. Changes that do not bump the version release nothing. Every pull request runs [CI](.github/workflows/ci.yml).
+Merge to `main`: the [Release workflow](.github/workflows/release.yml) publishes every change to the package as the next patch version (1.3.1 → 1.3.2) to the Terraform Registry (GoReleaser builds and signs the `vX.Y.Z` GitHub Release), writes the version into `VERSION` and tags the commit. Changes to docs, tests or CI publish nothing. For a minor or major version, raise it in `VERSION` in the same pull request. Every pull request runs [CI](.github/workflows/ci.yml).

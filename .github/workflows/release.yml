@@ -1,10 +1,12 @@
-# Releases automatically when VERSION changes on main:
-#   1. reads the version from VERSION
-#   2. if the tag vX.Y.Z does not exist yet, tags the commit
+# Publishes automatically on every push to main that changes the provider:
+#   1. next-version (jobcelis-team/.github) picks the version: the last release
+#      plus a patch, or the version in VERSION when it was raised by hand.
+#      Docs, tests, CI and repo config release nothing.
+#   2. writes it into VERSION, commits it, pushes it and tags vX.Y.Z
 #   3. GoReleaser builds, signs (GPG_PRIVATE_KEY) and creates the GitHub Release,
-#      which the Terraform Registry picks up
-# Bump VERSION to release; any other change releases nothing. Pushing a vX.Y.Z
-# tag by hand still works.
+#      which the Terraform Registry picks up as jobcelis-team/jobcelis
+# To release a minor or major version, raise it in VERSION. Pushing a vX.Y.Z tag
+# by hand still releases that tag.
 name: Release
 
 on:
@@ -28,46 +30,59 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Which release?
-        id: v
-        run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "release=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          TAG="v$(tr -d '[:space:]' < VERSION)"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "$TAG already exists: nothing to do"
-            echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Read version
+        id: current
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
 
-      # A tag pushed with GITHUB_TOKEN does not start other workflows, so GoReleaser runs here
-      - name: Tag the release
-        if: steps.v.outputs.release == 'true' && github.ref_type != 'tag'
+      - name: Next version
+        id: v
+        if: github.ref_type != 'tag'
+        uses: jobcelis-team/.github/actions/next-version@main
+        with:
+          current: ${{ steps.current.outputs.version }}
+          tag-prefix: "v"
+
+      - name: Write the version
+        if: steps.v.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: echo "$VERSION" > VERSION
+
+      - name: Commit the version
+        if: steps.v.outputs.release == 'true'
+        uses: jobcelis-team/.github/actions/commit-version@main
+        with:
+          version: ${{ steps.v.outputs.version }}
+
+      # GoReleaser releases the tag on HEAD, so tag before building. A tag pushed
+      # with GITHUB_TOKEN does not start other workflows, so GoReleaser runs here.
+      - name: Push the version and tag the release
+        if: steps.v.outputs.release == 'true'
+        uses: jobcelis-team/.github/actions/push-release@main
+        with:
+          tag: ${{ steps.v.outputs.tag }}
+
+      - name: Release?
+        id: go
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.v.outputs.tag }}" -m "${{ steps.v.outputs.tag }}"
-          git push origin "${{ steps.v.outputs.tag }}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] || [ "${{ steps.v.outputs.release }}" = "true" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/setup-go@v7
-        if: steps.v.outputs.release == 'true'
+        if: steps.go.outputs.release == 'true'
         with:
           go-version-file: go.mod
 
       - name: Import GPG key
         id: import_gpg
-        if: steps.v.outputs.release == 'true'
+        if: steps.go.outputs.release == 'true'
         uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
 
       - name: Run GoReleaser
-        if: steps.v.outputs.release == 'true'
+        if: steps.go.outputs.release == 'true'
         uses: goreleaser/goreleaser-action@v7
         with:
           args: release --clean
