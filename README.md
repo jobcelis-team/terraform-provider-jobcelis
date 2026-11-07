@@ -8,7 +8,8 @@ Manage Jobcelis resources as infrastructure-as-code with Terraform.
 terraform {
   required_providers {
     jobcelis = {
-      source = "vladimirCeli/jobcelis"
+      source = "jobcelis-team/jobcelis"
+      version = "~> 1.3"
     }
   }
 }
