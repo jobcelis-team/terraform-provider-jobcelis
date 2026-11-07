@@ -8,7 +8,7 @@ Manage Jobcelis resources as infrastructure-as-code with Terraform.
 terraform {
   required_providers {
     jobcelis = {
-      source = "jobcelis/jobcelis"
+      source = "vladimirCeli/jobcelis"
     }
   }
 }
@@ -234,7 +234,7 @@ go build -o terraform-provider-jobcelis
 
 ## License
 
-MIT
+Business Source License 1.1 (BUSL-1.1). See [LICENSE](LICENSE) for the full terms.
 
 ## Releasing
 
