@@ -61,6 +61,8 @@ jobs:
         uses: jobcelis-team/.github/actions/push-release@main
         with:
           tag: ${{ steps.v.outputs.tag }}
+          # GoReleaser creates the GitHub Release (signed checksums)
+          release: "false"
 
       - name: Release?
         id: go
