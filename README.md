@@ -16,9 +16,18 @@ terraform {
 
 provider "jobcelis" {
   api_key = var.jobcelis_api_key
+  # auth_token = var.jobcelis_auth_token  # only needed for jobcelis_project
   # base_url = "https://jobcelis.com"  # optional, defaults to production
 }
 ```
+
+| Argument     | Description |
+|--------------|-------------|
+| `api_key`    | Project API key. Used by every resource and data source except `jobcelis_project`. |
+| `auth_token` | User access token (JWT), sent as `Authorization: Bearer`. Needed only by `jobcelis_project`: the projects endpoints are per user and do not accept an API key. |
+| `base_url`   | Base URL of the API (default `https://jobcelis.com`). |
+
+All resources support `terraform import <address> <id>`.
 
 ## Resources
 
@@ -120,7 +129,7 @@ Manages event schemas for topic payload validation.
 ```hcl
 resource "jobcelis_event_schema" "order_created" {
   topic   = "order.created"
-  version = "1.0"
+  version = 1
 
   schema_body = jsonencode({
     type = "object"
@@ -137,12 +146,13 @@ resource "jobcelis_event_schema" "order_created" {
 | Attribute     | Type   | Required | Description                      |
 |---------------|--------|----------|----------------------------------|
 | `topic`       | string | yes      | Event topic this schema covers   |
-| `version`     | string | no       | Schema version identifier        |
+| `version`     | number | no       | Schema version (integer, default 1) |
 | `schema_body` | string | yes      | JSON string defining the schema  |
+| `status`      | string | computed | Current status                   |
 
 ### jobcelis_project
 
-Manages Jobcelis projects for organizing resources.
+Manages Jobcelis projects for organizing resources. Requires `auth_token` in the provider configuration (a user access token); an API key is not accepted by the projects endpoints.
 
 ```hcl
 resource "jobcelis_project" "production" {
@@ -223,6 +233,7 @@ output "project_name" {
 | Variable            | Description                                |
 |---------------------|--------------------------------------------|
 | `JOBCELIS_API_KEY`  | API key (alternative to provider config)   |
+| `JOBCELIS_AUTH_TOKEN` | User access token for `jobcelis_project` |
 | `JOBCELIS_BASE_URL` | Base URL (alternative to provider config)  |
 
 ## Building from Source
