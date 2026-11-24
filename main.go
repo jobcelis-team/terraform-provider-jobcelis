@@ -15,6 +15,7 @@
 //
 //	provider "jobcelis" {
 //	  api_key = var.jobcelis_api_key
+//	  # auth_token = var.jobcelis_auth_token  # only for jobcelis_project
 //	  # base_url = "https://jobcelis.com"  # optional
 //	}
 package main
@@ -26,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,15 +49,21 @@ func Provider() *schema.Provider {
 		Schema: map[string]*schema.Schema{
 			"api_key": {
 				Type:        schema.TypeString,
-				Required:    true,
+				Optional:    true,
 				Sensitive:   true,
 				DefaultFunc: schema.EnvDefaultFunc("JOBCELIS_API_KEY", nil),
-				Description: "API key for authenticating with the Jobcelis platform.",
+				Description: "Project API key. Used by every resource and data source except jobcelis_project.",
+			},
+			"auth_token": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Sensitive:   true,
+				DefaultFunc: schema.EnvDefaultFunc("JOBCELIS_AUTH_TOKEN", nil),
+				Description: "User access token (JWT), sent as a Bearer token. Required only by the jobcelis_project resource and data source, whose endpoints do not accept an API key.",
 			},
 			"base_url": {
 				Type:        schema.TypeString,
 				Optional:    true,
-				Default:     "https://jobcelis.com",
 				DefaultFunc: schema.EnvDefaultFunc("JOBCELIS_BASE_URL", "https://jobcelis.com"),
 				Description: "Base URL of the Jobcelis API.",
 			},
@@ -85,22 +94,28 @@ func Provider() *schema.Provider {
 type apiClient struct {
 	baseURL    string
 	apiKey     string
+	authToken  string
 	httpClient *http.Client
 }
 
 func providerConfigure(_ context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
-	apiKey := d.Get("api_key").(string)
-	baseURL := d.Get("base_url").(string)
+	apiKey, _ := d.Get("api_key").(string)
+	authToken, _ := d.Get("auth_token").(string)
+	baseURL, _ := d.Get("base_url").(string)
 
-	if apiKey == "" {
-		return nil, diag.Errorf("api_key is required")
+	if apiKey == "" && authToken == "" {
+		return nil, diag.Errorf("api_key (or JOBCELIS_API_KEY) is required; auth_token is needed only for jobcelis_project")
+	}
+	if baseURL == "" {
+		baseURL = "https://jobcelis.com"
 	}
 
 	baseURL = strings.TrimRight(baseURL, "/")
 
 	client := &apiClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
+		baseURL:   baseURL,
+		apiKey:    apiKey,
+		authToken: authToken,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -109,11 +124,28 @@ func providerConfigure(_ context.Context, d *schema.ResourceData) (interface{}, 
 	return client, nil
 }
 
-// doRequest executes an HTTP request and returns the response body bytes.
+// doRequest executes an HTTP request authenticated with the project API key and
+// returns the response body bytes.
 // For DELETE requests that return 204, it returns nil bytes and no error.
 // For 404 responses, it returns an empty body with no error (caller handles state removal).
 func (c *apiClient) doRequest(method, path string, body interface{}) ([]byte, int, error) {
-	url := fmt.Sprintf("%s%s", c.baseURL, path)
+	if c.apiKey == "" {
+		return nil, 0, fmt.Errorf("api_key is not set in the provider configuration")
+	}
+	return c.send(method, path, body, "X-Api-Key", c.apiKey)
+}
+
+// doUserRequest executes an HTTP request authenticated with the user access
+// token (Bearer), for the endpoints that do not accept an API key (projects).
+func (c *apiClient) doUserRequest(method, path string, body interface{}) ([]byte, int, error) {
+	if c.authToken == "" {
+		return nil, 0, fmt.Errorf("auth_token is not set in the provider configuration: the projects endpoints require a user access token, not an API key")
+	}
+	return c.send(method, path, body, "Authorization", "Bearer "+c.authToken)
+}
+
+func (c *apiClient) send(method, path string, body interface{}, authHeader, authValue string) ([]byte, int, error) {
+	fullURL := c.baseURL + path
 
 	var reqBody io.Reader
 	if body != nil {
@@ -124,13 +156,13 @@ func (c *apiClient) doRequest(method, path string, body interface{}) ([]byte, in
 		reqBody = bytes.NewBuffer(jsonBytes)
 	}
 
-	req, err := http.NewRequest(method, url, reqBody)
+	req, err := http.NewRequest(method, fullURL, reqBody)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Api-Key", c.apiKey)
+	req.Header.Set(authHeader, authValue)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -161,6 +193,49 @@ func (c *apiClient) doRequest(method, path string, body interface{}) ([]byte, in
 	return respBody, resp.StatusCode, nil
 }
 
+// decodeObject parses a JSON object response. Some endpoints wrap the object in
+// {"data": {...}}; that envelope is removed.
+func decodeObject(body []byte) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if inner, ok := result["data"].(map[string]interface{}); ok {
+		return inner, nil
+	}
+	return result, nil
+}
+
+// suppressEquivalentJSON hides diffs between two JSON strings that encode the
+// same value (key order, whitespace).
+func suppressEquivalentJSON(_, oldValue, newValue string, _ *schema.ResourceData) bool {
+	if oldValue == newValue {
+		return true
+	}
+	var o, n interface{}
+	if err := json.Unmarshal([]byte(oldValue), &o); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(newValue), &n); err != nil {
+		return false
+	}
+	ob, err1 := json.Marshal(o)
+	nb, err2 := json.Marshal(n)
+	return err1 == nil && err2 == nil && bytes.Equal(ob, nb)
+}
+
+// toInt converts a JSON number (float64) or numeric string to an int.
+func toInt(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case string:
+		i, err := strconv.Atoi(n)
+		return i, err == nil
+	}
+	return 0, false
+}
+
 // ---------------------------------------------------------------------------
 // Helper: convert []interface{} to []string for topic lists
 // ---------------------------------------------------------------------------
@@ -184,6 +259,9 @@ func resourceWebhook() *schema.Resource {
 		ReadContext:   resourceWebhookRead,
 		UpdateContext: resourceWebhookUpdate,
 		DeleteContext: resourceWebhookDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
 		Schema: map[string]*schema.Schema{
 			"url": {
 				Type:        schema.TypeString,
@@ -229,8 +307,8 @@ func resourceWebhookCreate(_ context.Context, d *schema.ResourceData, m interfac
 		return diag.FromErr(fmt.Errorf("failed to create webhook: %w", err))
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse create webhook response: %w", err))
 	}
 
@@ -246,7 +324,7 @@ func resourceWebhookCreate(_ context.Context, d *schema.ResourceData, m interfac
 func resourceWebhookRead(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/webhooks/%s", d.Id()), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/webhooks/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read webhook %s: %w", d.Id(), err))
 	}
@@ -255,8 +333,8 @@ func resourceWebhookRead(_ context.Context, d *schema.ResourceData, m interface{
 		return nil
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse webhook response: %w", err))
 	}
 
@@ -279,11 +357,14 @@ func resourceWebhookUpdate(_ context.Context, d *schema.ResourceData, m interfac
 	payload := map[string]interface{}{
 		"url": d.Get("url").(string),
 	}
+	if d.HasChange("secret") {
+		payload["secret"] = d.Get("secret").(string)
+	}
 	if v, ok := d.GetOk("topics"); ok {
 		payload["topics"] = expandStringList(v.([]interface{}))
 	}
 
-	_, _, err := client.doRequest("PATCH", fmt.Sprintf("/api/v1/webhooks/%s", d.Id()), payload)
+	_, _, err := client.doRequest("PATCH", "/api/v1/webhooks/"+url.PathEscape(d.Id()), payload)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to update webhook %s: %w", d.Id(), err))
 	}
@@ -294,7 +375,7 @@ func resourceWebhookUpdate(_ context.Context, d *schema.ResourceData, m interfac
 func resourceWebhookDelete(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	_, _, err := client.doRequest("DELETE", fmt.Sprintf("/api/v1/webhooks/%s", d.Id()), nil)
+	_, _, err := client.doRequest("DELETE", "/api/v1/webhooks/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to delete webhook %s: %w", d.Id(), err))
 	}
@@ -314,6 +395,9 @@ func resourcePipeline() *schema.Resource {
 		ReadContext:   resourcePipelineRead,
 		UpdateContext: resourcePipelineUpdate,
 		DeleteContext: resourcePipelineDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -337,9 +421,10 @@ func resourcePipeline() *schema.Resource {
 				Elem:        &schema.Schema{Type: schema.TypeString},
 			},
 			"steps": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Description: "JSON-encoded array of pipeline steps.",
+				Type:             schema.TypeString,
+				Optional:         true,
+				Description:      "JSON-encoded array of pipeline steps.",
+				DiffSuppressFunc: suppressEquivalentJSON,
 			},
 			"status": {
 				Type:        schema.TypeString,
@@ -377,8 +462,8 @@ func resourcePipelineCreate(_ context.Context, d *schema.ResourceData, m interfa
 		return diag.FromErr(fmt.Errorf("failed to create pipeline: %w", err))
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse create pipeline response: %w", err))
 	}
 
@@ -394,7 +479,7 @@ func resourcePipelineCreate(_ context.Context, d *schema.ResourceData, m interfa
 func resourcePipelineRead(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/pipelines/%s", d.Id()), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/pipelines/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read pipeline %s: %w", d.Id(), err))
 	}
@@ -403,8 +488,8 @@ func resourcePipelineRead(_ context.Context, d *schema.ResourceData, m interface
 		return nil
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse pipeline response: %w", err))
 	}
 
@@ -437,7 +522,8 @@ func resourcePipelineUpdate(_ context.Context, d *schema.ResourceData, m interfa
 	client := m.(*apiClient)
 
 	payload := map[string]interface{}{
-		"name": d.Get("name").(string),
+		"name":       d.Get("name").(string),
+		"webhook_id": d.Get("webhook_id").(string),
 	}
 	if v, ok := d.GetOk("description"); ok {
 		payload["description"] = v.(string)
@@ -453,7 +539,7 @@ func resourcePipelineUpdate(_ context.Context, d *schema.ResourceData, m interfa
 		payload["steps"] = steps
 	}
 
-	_, _, err := client.doRequest("PATCH", fmt.Sprintf("/api/v1/pipelines/%s", d.Id()), payload)
+	_, _, err := client.doRequest("PATCH", "/api/v1/pipelines/"+url.PathEscape(d.Id()), payload)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to update pipeline %s: %w", d.Id(), err))
 	}
@@ -464,7 +550,7 @@ func resourcePipelineUpdate(_ context.Context, d *schema.ResourceData, m interfa
 func resourcePipelineDelete(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	_, _, err := client.doRequest("DELETE", fmt.Sprintf("/api/v1/pipelines/%s", d.Id()), nil)
+	_, _, err := client.doRequest("DELETE", "/api/v1/pipelines/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to delete pipeline %s: %w", d.Id(), err))
 	}
@@ -484,6 +570,9 @@ func resourceJob() *schema.Resource {
 		ReadContext:   resourceJobRead,
 		UpdateContext: resourceJobUpdate,
 		DeleteContext: resourceJobDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -503,7 +592,7 @@ func resourceJob() *schema.Resource {
 			"topics": {
 				Type:        schema.TypeList,
 				Optional:    true,
-				Description: "Event topics this job processes.",
+				Description: "Event topics for the job. The API emits the job's event on the first topic.",
 				Elem:        &schema.Schema{Type: schema.TypeString},
 			},
 			"webhook_id": {
@@ -529,7 +618,12 @@ func resourceJobCreate(_ context.Context, d *schema.ResourceData, m interface{})
 		"cron_expression": d.Get("cron_expression").(string),
 	}
 	if v, ok := d.GetOk("topics"); ok {
-		payload["topics"] = expandStringList(v.([]interface{}))
+		topics := expandStringList(v.([]interface{}))
+		payload["topics"] = topics
+		// The API runs a job's action on a single topic.
+		if len(topics) > 0 {
+			payload["topic"] = topics[0]
+		}
 	}
 	if v, ok := d.GetOk("webhook_id"); ok {
 		payload["webhook_id"] = v.(string)
@@ -540,8 +634,8 @@ func resourceJobCreate(_ context.Context, d *schema.ResourceData, m interface{})
 		return diag.FromErr(fmt.Errorf("failed to create job: %w", err))
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse create job response: %w", err))
 	}
 
@@ -557,7 +651,7 @@ func resourceJobCreate(_ context.Context, d *schema.ResourceData, m interface{})
 func resourceJobRead(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/jobs/%s", d.Id()), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/jobs/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read job %s: %w", d.Id(), err))
 	}
@@ -566,8 +660,8 @@ func resourceJobRead(_ context.Context, d *schema.ResourceData, m interface{}) d
 		return nil
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse job response: %w", err))
 	}
 
@@ -602,13 +696,18 @@ func resourceJobUpdate(_ context.Context, d *schema.ResourceData, m interface{})
 		"cron_expression": d.Get("cron_expression").(string),
 	}
 	if v, ok := d.GetOk("topics"); ok {
-		payload["topics"] = expandStringList(v.([]interface{}))
+		topics := expandStringList(v.([]interface{}))
+		payload["topics"] = topics
+		// The API runs a job's action on a single topic.
+		if len(topics) > 0 {
+			payload["topic"] = topics[0]
+		}
 	}
 	if v, ok := d.GetOk("webhook_id"); ok {
 		payload["webhook_id"] = v.(string)
 	}
 
-	_, _, err := client.doRequest("PATCH", fmt.Sprintf("/api/v1/jobs/%s", d.Id()), payload)
+	_, _, err := client.doRequest("PATCH", "/api/v1/jobs/"+url.PathEscape(d.Id()), payload)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to update job %s: %w", d.Id(), err))
 	}
@@ -619,7 +718,7 @@ func resourceJobUpdate(_ context.Context, d *schema.ResourceData, m interface{})
 func resourceJobDelete(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	_, _, err := client.doRequest("DELETE", fmt.Sprintf("/api/v1/jobs/%s", d.Id()), nil)
+	_, _, err := client.doRequest("DELETE", "/api/v1/jobs/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to delete job %s: %w", d.Id(), err))
 	}
@@ -639,6 +738,9 @@ func resourceEventSchema() *schema.Resource {
 		ReadContext:   resourceEventSchemaRead,
 		UpdateContext: resourceEventSchemaUpdate,
 		DeleteContext: resourceEventSchemaDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
 		Schema: map[string]*schema.Schema{
 			"topic": {
 				Type:        schema.TypeString,
@@ -646,14 +748,21 @@ func resourceEventSchema() *schema.Resource {
 				Description: "The event topic this schema applies to.",
 			},
 			"version": {
-				Type:        schema.TypeString,
+				Type:        schema.TypeInt,
 				Optional:    true,
-				Description: "Schema version identifier.",
+				Computed:    true,
+				Description: "Schema version (an integer; the API defaults to 1).",
 			},
 			"schema_body": {
+				Type:             schema.TypeString,
+				Required:         true,
+				Description:      "JSON string defining the event schema (sent to the API as \"schema\").",
+				DiffSuppressFunc: suppressEquivalentJSON,
+			},
+			"status": {
 				Type:        schema.TypeString,
-				Required:    true,
-				Description: "JSON string defining the event schema.",
+				Computed:    true,
+				Description: "Current status of the schema.",
 			},
 		},
 	}
@@ -669,11 +778,11 @@ func resourceEventSchemaCreate(_ context.Context, d *schema.ResourceData, m inte
 	}
 
 	payload := map[string]interface{}{
-		"topic":       d.Get("topic").(string),
-		"schema_body": schemaBody,
+		"topic":  d.Get("topic").(string),
+		"schema": schemaBody,
 	}
 	if v, ok := d.GetOk("version"); ok {
-		payload["version"] = v.(string)
+		payload["version"] = v.(int)
 	}
 
 	body, _, err := client.doRequest("POST", "/api/v1/event-schemas", payload)
@@ -681,8 +790,8 @@ func resourceEventSchemaCreate(_ context.Context, d *schema.ResourceData, m inte
 		return diag.FromErr(fmt.Errorf("failed to create event schema: %w", err))
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse create event schema response: %w", err))
 	}
 
@@ -698,7 +807,7 @@ func resourceEventSchemaCreate(_ context.Context, d *schema.ResourceData, m inte
 func resourceEventSchemaRead(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/event-schemas/%s", d.Id()), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/event-schemas/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read event schema %s: %w", d.Id(), err))
 	}
@@ -707,18 +816,21 @@ func resourceEventSchemaRead(_ context.Context, d *schema.ResourceData, m interf
 		return nil
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse event schema response: %w", err))
 	}
 
 	if v, ok := result["topic"]; ok {
 		_ = d.Set("topic", v)
 	}
-	if v, ok := result["version"]; ok {
+	if v, ok := toInt(result["version"]); ok {
 		_ = d.Set("version", v)
 	}
-	if v, ok := result["schema_body"]; ok {
+	if v, ok := result["status"]; ok {
+		_ = d.Set("status", v)
+	}
+	if v, ok := result["schema"]; ok {
 		schemaJSON, err := json.Marshal(v)
 		if err == nil {
 			_ = d.Set("schema_body", string(schemaJSON))
@@ -737,14 +849,14 @@ func resourceEventSchemaUpdate(_ context.Context, d *schema.ResourceData, m inte
 	}
 
 	payload := map[string]interface{}{
-		"topic":       d.Get("topic").(string),
-		"schema_body": schemaBody,
+		"topic":  d.Get("topic").(string),
+		"schema": schemaBody,
 	}
 	if v, ok := d.GetOk("version"); ok {
-		payload["version"] = v.(string)
+		payload["version"] = v.(int)
 	}
 
-	_, _, err := client.doRequest("PATCH", fmt.Sprintf("/api/v1/event-schemas/%s", d.Id()), payload)
+	_, _, err := client.doRequest("PATCH", "/api/v1/event-schemas/"+url.PathEscape(d.Id()), payload)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to update event schema %s: %w", d.Id(), err))
 	}
@@ -755,7 +867,7 @@ func resourceEventSchemaUpdate(_ context.Context, d *schema.ResourceData, m inte
 func resourceEventSchemaDelete(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	_, _, err := client.doRequest("DELETE", fmt.Sprintf("/api/v1/event-schemas/%s", d.Id()), nil)
+	_, _, err := client.doRequest("DELETE", "/api/v1/event-schemas/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to delete event schema %s: %w", d.Id(), err))
 	}
@@ -770,11 +882,14 @@ func resourceEventSchemaDelete(_ context.Context, d *schema.ResourceData, m inte
 
 func resourceProject() *schema.Resource {
 	return &schema.Resource{
-		Description:   "Manages a Jobcelis project.",
+		Description:   "Manages a Jobcelis project. Requires auth_token (a user access token) in the provider configuration: the projects endpoints do not accept an API key.",
 		CreateContext: resourceProjectCreate,
 		ReadContext:   resourceProjectRead,
 		UpdateContext: resourceProjectUpdate,
 		DeleteContext: resourceProjectDelete,
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
 		Schema: map[string]*schema.Schema{
 			"name": {
 				Type:        schema.TypeString,
@@ -792,13 +907,13 @@ func resourceProjectCreate(_ context.Context, d *schema.ResourceData, m interfac
 		"name": d.Get("name").(string),
 	}
 
-	body, _, err := client.doRequest("POST", "/api/v1/projects", payload)
+	body, _, err := client.doUserRequest("POST", "/api/v1/projects", payload)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to create project: %w", err))
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse create project response: %w", err))
 	}
 
@@ -814,7 +929,7 @@ func resourceProjectCreate(_ context.Context, d *schema.ResourceData, m interfac
 func resourceProjectRead(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/projects/%s", d.Id()), nil)
+	body, statusCode, err := client.doUserRequest("GET", "/api/v1/projects/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read project %s: %w", d.Id(), err))
 	}
@@ -823,8 +938,8 @@ func resourceProjectRead(_ context.Context, d *schema.ResourceData, m interface{
 		return nil
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse project response: %w", err))
 	}
 
@@ -842,7 +957,7 @@ func resourceProjectUpdate(_ context.Context, d *schema.ResourceData, m interfac
 		"name": d.Get("name").(string),
 	}
 
-	_, _, err := client.doRequest("PATCH", fmt.Sprintf("/api/v1/projects/%s", d.Id()), payload)
+	_, _, err := client.doUserRequest("PATCH", "/api/v1/projects/"+url.PathEscape(d.Id()), payload)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to update project %s: %w", d.Id(), err))
 	}
@@ -853,7 +968,7 @@ func resourceProjectUpdate(_ context.Context, d *schema.ResourceData, m interfac
 func resourceProjectDelete(_ context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	client := m.(*apiClient)
 
-	_, _, err := client.doRequest("DELETE", fmt.Sprintf("/api/v1/projects/%s", d.Id()), nil)
+	_, _, err := client.doUserRequest("DELETE", "/api/v1/projects/"+url.PathEscape(d.Id()), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to delete project %s: %w", d.Id(), err))
 	}
@@ -887,7 +1002,7 @@ func dataSourceWebhookRead(_ context.Context, d *schema.ResourceData, m interfac
 	client := m.(*apiClient)
 	webhookID := d.Get("webhook_id").(string)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/webhooks/%s", webhookID), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/webhooks/"+url.PathEscape(webhookID), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read webhook %s: %w", webhookID, err))
 	}
@@ -895,8 +1010,8 @@ func dataSourceWebhookRead(_ context.Context, d *schema.ResourceData, m interfac
 		return diag.Errorf("webhook %s not found", webhookID)
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse webhook response: %w", err))
 	}
 
@@ -939,7 +1054,7 @@ func dataSourcePipelineRead(_ context.Context, d *schema.ResourceData, m interfa
 	client := m.(*apiClient)
 	pipelineID := d.Get("pipeline_id").(string)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/pipelines/%s", pipelineID), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/pipelines/"+url.PathEscape(pipelineID), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read pipeline %s: %w", pipelineID, err))
 	}
@@ -947,8 +1062,8 @@ func dataSourcePipelineRead(_ context.Context, d *schema.ResourceData, m interfa
 		return diag.Errorf("pipeline %s not found", pipelineID)
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse pipeline response: %w", err))
 	}
 
@@ -994,7 +1109,7 @@ func dataSourceJobRead(_ context.Context, d *schema.ResourceData, m interface{})
 	client := m.(*apiClient)
 	jobID := d.Get("job_id").(string)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/jobs/%s", jobID), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/jobs/"+url.PathEscape(jobID), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read job %s: %w", jobID, err))
 	}
@@ -1002,8 +1117,8 @@ func dataSourceJobRead(_ context.Context, d *schema.ResourceData, m interface{})
 		return diag.Errorf("job %s not found", jobID)
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse job response: %w", err))
 	}
 
@@ -1045,8 +1160,9 @@ func dataSourceEventSchema() *schema.Resource {
 				Description: "The ID of the event schema to look up.",
 			},
 			"topic":       {Type: schema.TypeString, Computed: true, Description: "Event topic."},
-			"version":     {Type: schema.TypeString, Computed: true, Description: "Schema version."},
+			"version":     {Type: schema.TypeInt, Computed: true, Description: "Schema version."},
 			"schema_body": {Type: schema.TypeString, Computed: true, Description: "JSON schema body."},
+			"status":      {Type: schema.TypeString, Computed: true, Description: "Current status."},
 		},
 	}
 }
@@ -1055,7 +1171,7 @@ func dataSourceEventSchemaRead(_ context.Context, d *schema.ResourceData, m inte
 	client := m.(*apiClient)
 	schemaID := d.Get("event_schema_id").(string)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/event-schemas/%s", schemaID), nil)
+	body, statusCode, err := client.doRequest("GET", "/api/v1/event-schemas/"+url.PathEscape(schemaID), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read event schema %s: %w", schemaID, err))
 	}
@@ -1063,8 +1179,8 @@ func dataSourceEventSchemaRead(_ context.Context, d *schema.ResourceData, m inte
 		return diag.Errorf("event schema %s not found", schemaID)
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse event schema response: %w", err))
 	}
 
@@ -1072,10 +1188,13 @@ func dataSourceEventSchemaRead(_ context.Context, d *schema.ResourceData, m inte
 	if v, ok := result["topic"]; ok {
 		_ = d.Set("topic", v)
 	}
-	if v, ok := result["version"]; ok {
+	if v, ok := toInt(result["version"]); ok {
 		_ = d.Set("version", v)
 	}
-	if v, ok := result["schema_body"]; ok {
+	if v, ok := result["status"]; ok {
+		_ = d.Set("status", v)
+	}
+	if v, ok := result["schema"]; ok {
 		schemaJSON, err := json.Marshal(v)
 		if err == nil {
 			_ = d.Set("schema_body", string(schemaJSON))
@@ -1091,7 +1210,7 @@ func dataSourceEventSchemaRead(_ context.Context, d *schema.ResourceData, m inte
 
 func dataSourceProject() *schema.Resource {
 	return &schema.Resource{
-		Description: "Retrieves information about an existing Jobcelis project.",
+		Description: "Retrieves information about an existing Jobcelis project. Requires auth_token in the provider configuration.",
 		ReadContext: dataSourceProjectRead,
 		Schema: map[string]*schema.Schema{
 			"project_id": {
@@ -1108,7 +1227,7 @@ func dataSourceProjectRead(_ context.Context, d *schema.ResourceData, m interfac
 	client := m.(*apiClient)
 	projectID := d.Get("project_id").(string)
 
-	body, statusCode, err := client.doRequest("GET", fmt.Sprintf("/api/v1/projects/%s", projectID), nil)
+	body, statusCode, err := client.doUserRequest("GET", "/api/v1/projects/"+url.PathEscape(projectID), nil)
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to read project %s: %w", projectID, err))
 	}
@@ -1116,8 +1235,8 @@ func dataSourceProjectRead(_ context.Context, d *schema.ResourceData, m interfac
 		return diag.Errorf("project %s not found", projectID)
 	}
 
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
+	result, err := decodeObject(body)
+	if err != nil {
 		return diag.FromErr(fmt.Errorf("failed to parse project response: %w", err))
 	}
 
